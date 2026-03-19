@@ -110,4 +110,5 @@ self-correcting-rag-langgraph/
 
 📝 License
 
-MIT © Shankar L RF
+
+MIT © Shankar L R
