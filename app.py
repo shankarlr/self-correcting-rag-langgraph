@@ -9,14 +9,12 @@ import streamlit as st
 import time
 from crag_demo import ask_with_stats
 
-# Must be the first Streamlit command
 st.set_page_config(
     page_title="Self-Correcting RAG",
     page_icon="⚡",
     layout="wide"
 )
 
-# Initialize ALL session state variables at the start
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "processing" not in st.session_state:
@@ -120,7 +118,7 @@ for message in st.session_state.messages:
         if "time" in message:
             st.caption(f"⏱️ {message['time']:.2f}s | 🔄 {message.get('retries', 0)} retries")
 
-# Input area - THIS IS THE KEY FIX
+# Input area 
 with st.container():
     col1, col2 = st.columns([6, 1])
     
@@ -184,18 +182,14 @@ if (submit or st.session_state.processing) and st.session_state.current_question
         "retries": retries
     })
     
-    # Update stats
     st.session_state.total_queries += 1
     st.session_state.total_time += elapsed
     
-    # Reset processing state
     st.session_state.processing = False
     st.session_state.current_question = ""
     
-    # Force a rerun to update the UI
     st.rerun()
 
-# Handle example button clicks
 elif st.session_state.processing and not st.session_state.current_question:
     # This shouldn't happen, but just in case
     st.session_state.processing = False
