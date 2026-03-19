@@ -1,0 +1,37 @@
+Professional Summary
+Aspiring Data Analyst with expertise in data cleaning, visualization, and statistical analysis. Proficient in Excel, SQL, Tableau, and Power BI, with a strong focus on leveraging data-driven insights to solve business challenges. Skilled in machine learning, Python programming, and advanced analytics tools. Adept at transforming complex data into actionable strategies for decision-making. Eager to deliver impactful solutions in fast-paced, collaborative environments.
+
+Experience
+Concentrix + Webhelp | Bangalore
+Representative, Operations | 01/2024 - Present
+
+Demonstrated critical thinking to bring structure to unstructured problems, improving operational efficiency.
+Utilized tools like Excel, Tableau, and SQL to extract, cleanse, and analyze performance data for actionable insights.
+Designed and implemented interactive dashboards and customized reports to monitor and optimize productivity in real-time.
+Reviewed data analysis workflows for accuracy and relevance, ensuring alignment with organizational goals.
+Mentored junior team members on best practices for data analysis and visualization.
+Promoted a collaborative work environment by effectively communicating insights to stakeholders and leadership.
+Skills
+
+Data Analytics Tools: Oracle Analytics Cloud (OAC), Tableau, Power BI, Google Sheets
+Data Management: SQL, Python (Pandas, NumPy), Data Wrangling, ETL Processes
+Visualization & Reporting: Dashboards, Storytelling with Data, Advanced Visualizations
+Machine Learning: Supervised & Unsupervised Learning, Feature Engineering, NLP
+Statistical Analysis: Descriptive Statistics, Regression Analysis, Hypothesis Testing
+Other Skills: Critical Thinking, Collaboration, Communication, Industry Trend Analysis
+Education
+Kuvempu University | Shivamogga
+Bachelor of Computer Applications | 10/2023
+Graduated with 63% in Computer Programming Specialization.
+
+Certifications
+
+Python: Cisco Network Academy
+Data Analytics: Cisco Network Academy
+Machine Learning: Kaggle Google Certification
+Projects
+Skin Infection Detector
+Developed a CNN model using TensorFlow and OpenCV to identify skin infections. Enhanced model performance using image preprocessing and augmentation, achieving high accuracy and recall rates.
+
+Vrindana Store Data Analysis 2022
+Conducted data analysis on sales, inventory, and customer metrics. Built an interactive dashboard to visualize KPIs, enabling real-time decision-making.

@@ -1,22 +1,36 @@
 """
-SELF-CORRECTING RAG WITH LANGGRAPH - FINAL VERSION
-Key Features:
-- Self-correcting retrieval with document grading
-- Local LLMs (Ollama) - no API costs
-- Smart rewrite logic (only when needed)
-- Prevents infinite loops with max retries
+SELF-CORRECTING RAG WITH LANGGRAPH - FINAL PRODUCTION VERSION
+Preserves core self-correction while being reasonably fast.
+- Grades documents (core feature)
+- Rewrites queries when needed (core feature)
+- Self-corrects with max retries
 """
 
 import os
+import pickle
+import time
+import sys
+import threading
 from dotenv import load_dotenv
 from typing import Dict, List, TypedDict, Annotated, Literal
 import operator
+
+# Suppress verbose logging
+import logging
+logging.getLogger().setLevel(logging.ERROR)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Chroma import
+try:
+    from langchain_chroma import Chroma
+except ImportError:
+    os.system("pip install -q langchain-chroma")
+    from langchain_chroma import Chroma
 
 from langgraph.graph import StateGraph, END, START
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -24,23 +38,42 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-# ============ PART 1: DEFINE STATE (Agent's Memory) ============
+# ============ CONFIGURATION ============
+VECTORSTORE_PATH = "chroma_db"
+DOCS_CACHE = "docs_cache.pkl"
+MAX_RETRIES = 2                # Self-correction needs retries
+TOP_K_RESULTS = 3               # Enough documents to grade
+SILENT_MODE = True
+MODEL_NAME = "tinyllama"        # Fast enough for self-correction
+TIMEOUT_SECONDS = 60
 
+# ============ CACHES ============
+query_cache = {}
+llm_cache = {}
+
+# ============ STATE ============
 class GraphState(TypedDict):
-    """State schema for our LangGraph agent"""
-    question: str                          # Current question being processed
-    documents: Annotated[List[Document], operator.add]  # Retrieved documents
-    generation: str                         # Final generated answer
-    retries: int                            # Number of rewrite attempts
-    needs_web_search: bool                   # Flag for triggering rewrite
+    question: str
+    documents: Annotated[List[Document], operator.add]
+    generation: str
+    retries: int
+    needs_web_search: bool
+
+# ============ VECTOR STORE ============
+def get_vectorstore():
+    if os.path.exists(VECTORSTORE_PATH):
+        if not SILENT_MODE:
+            print("📂 Loading existing vector store...")
+        vector_store = Chroma(
+            collection_name='rag-chroma-local',
+            embedding_function=OllamaEmbeddings(model="nomic-embed-text"),
+            persist_directory=VECTORSTORE_PATH
+        )
+        return vector_store.as_retriever(search_kwargs={"k": TOP_K_RESULTS})
     
-print("✅ State defined - agent memory structure ready")
-
-# ============ PART 2: SETUP KNOWLEDGE BASE ============
-
-def setup_vectorstore():
-    """Load documents and create searchable vector database"""
-    print("📚 Loading documents...")
+    if not SILENT_MODE:
+        print("🆕 First time setup - creating vector store...")
+        print("📚 Loading documents...")
     
     urls = [
         "https://lilianweng.github.io/posts/2023-06-23-agent/",
@@ -52,268 +85,192 @@ def setup_vectorstore():
         loader = WebBaseLoader(url)
         docs.extend(loader.load())
     
-    # Split documents into smaller chunks for better retrieval
+    with open(DOCS_CACHE, 'wb') as f:
+        pickle.dump(docs, f)
+    
     text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=250, 
+        chunk_size=250,          # Standard size for good context
         chunk_overlap=50
     )
     splits = text_splitter.split_documents(docs)
-    print(f"   Created {len(splits)} document chunks")
+    if not SILENT_MODE:
+        print(f"   Created {len(splits)} chunks")
     
-    # Create vector store with local embeddings
     vector_store = Chroma.from_documents(
         documents=splits,
         collection_name='rag-chroma-local',
-        embedding=OllamaEmbeddings(model="nomic-embed-text")  # Local embeddings!
+        embedding=OllamaEmbeddings(model="nomic-embed-text"),
+        persist_directory=VECTORSTORE_PATH
     )
     
-    return vector_store.as_retriever(search_kwargs={"k": 4})  # Get 4 docs per query
+    return vector_store.as_retriever(search_kwargs={"k": TOP_K_RESULTS})
 
-retriever = setup_vectorstore()
-print("✅ Vectorstore ready with local embeddings")
+retriever = get_vectorstore()
 
-# ============ PART 3: NODE FUNCTIONS ============
+# ============ CACHED RETRIEVAL ============
+def cached_retrieve(question: str):
+    if question in query_cache:
+        return query_cache[question]
+    docs = retriever.invoke(question)
+    query_cache[question] = docs
+    return docs
 
+# ============ NODE FUNCTIONS ============
 def retrieve(state: GraphState) -> Dict:
-    """
-    Node 1: Retrieve relevant documents from vector database
-    FIXED: Using .invoke() instead of deprecated ._get_relevant_documents()
-    """
-    print("\n---🔍 NODE: RETRIEVE ---")
     question = state["question"]
-    
-    # CORRECT: Use invoke() method (new LangChain style)
-    documents = retriever.invoke(question)
-    print(f"   Retrieved {len(documents)} documents")
-    
-    return {
-        "documents": documents,
-        "question": question,
-        "retries": state.get("retries", 0)
-    }
-    
+    documents = cached_retrieve(question)
+    return {"documents": documents, "question": question, "retries": state.get("retries", 0)}
+
 def grade_documents(state: GraphState) -> Dict:
-    """
-    Node 2: Grade document relevance - THE HEART OF SELF-CORRECTION
-    FIXED: Only triggers rewrite if NO documents are relevant
-    FIXED: Proper type hints (GraphState not StateGraph)
-    """
-    print("\n---⭐ NODE: GRADE DOCUMENTS ---")
-    
+    """Core self-correction: grade each document and decide if rewrite needed"""
     class RelevanceGrade(BaseModel):
-        """Structured output for relevance grading"""
-        binary_score: Literal['yes', 'no'] = Field(
-            description="Document is relevant to question (yes/no)"
-        )
+        binary_score: Literal['yes', 'no'] = Field(description="Is document relevant? (yes/no)")
     
-    # Use local LLM for grading (low temperature for consistency)
-    llm = ChatOllama(model="mistral", temperature=0)
+    llm = ChatOllama(model=MODEL_NAME, temperature=0.1, num_predict=10)
     
     grader_prompt = PromptTemplate(
-        template="""You are a grader assessing relevance of a retrieved document to a user question.
-        
-        Retrieved document: {document}
-        User question: {question}
-        
-        If the document contains keywords or meaning related to the question, grade it as relevant.
-        Give a binary score 'yes' or 'no'.
-        """,
+        template="""Document: {document}
+Question: {question}
+Relevant? Answer exactly 'yes' or 'no':""",
         input_variables=["document", "question"],
-    )   
+    )
     
-    # Chain: prompt → LLM with structured output
-    grader_chain = grader_prompt | llm.with_structured_output(RelevanceGrade)
+    grader_chain = grader_prompt | llm | StrOutputParser()
     
     filtered_docs = []
     relevant_count = 0
     
-    # Grade each document
-    for i, doc in enumerate(state["documents"], 1):
-        print(f"   Grading document {i}...")
+    for doc in state["documents"]:
+        doc_preview = doc.page_content[:200]
+        cache_key = f"grade_{hash(doc_preview)}_{state['question']}"
         
-        grade = grader_chain.invoke({
-            "document": doc.page_content[:500],  # First 500 chars is enough
-            "question": state["question"]
-        })
+        if cache_key in llm_cache:
+            grade_text = llm_cache[cache_key]
+        else:
+            grade_text = grader_chain.invoke({
+                "document": doc_preview,
+                "question": state["question"]
+            })
+            llm_cache[cache_key] = grade_text
         
-        if grade.binary_score == "yes":
-            print(f"      ✅ Document {i} - RELEVANT (keeping)")
+        # Simple string parsing (more reliable than structured output)
+        is_relevant = 'yes' in grade_text.lower().strip()
+        
+        if is_relevant:
             filtered_docs.append(doc)
             relevant_count += 1
-        else:
-            print(f"      ❌ Document {i} - NOT RELEVANT")
     
-    # KEY FIX: Only trigger rewrite if NO documents are relevant
-    # This prevents over-correction and infinite loops
+    # Self-correction trigger: if no relevant docs, needs rewrite
     needs_search = (relevant_count == 0)
     
-    if needs_search:
-        print(f"   ⚠️ No relevant documents found (0/{len(state['documents'])}). Need rewrite.")
-    else:
-        print(f"   ✅ Found {relevant_count}/{len(state['documents'])} relevant documents. Good to generate.")
-            
     return {
         "documents": filtered_docs,
         "needs_web_search": needs_search,
         "question": state["question"],
         "retries": state.get("retries", 0) + 1
     }
-    
+
 def rewrite_query(state: GraphState) -> Dict:
-    """
-    Node 3: Rewrite query when retrieval fails
-    FIXED: Using correct Ollama model (mistral, not gpt-3.5-turbo)
-    FIXED: Proper return structure
-    """
-    print("\n---✏️ NODE: REWRITE QUERY ---")
-    
-    # FIXED: Use mistral (Ollama model) with higher temperature for creativity
-    llm = ChatOllama(model="mistral", temperature=0.7)
+    """Rewrite query when no relevant documents found"""
+    llm = ChatOllama(model=MODEL_NAME, temperature=0.7, num_predict=50)
     
     rewrite_prompt = PromptTemplate(
-        template="""You are generating an improved search query.
-        Original question: {question}
-        
-        This query failed to retrieve relevant documents.
-        Generate a better version that's more specific and uses key terms.
-        
-        Better query:""",
+        template="""Original query: {question}
+Improved query (more specific):""",
         input_variables=["question"],
     )
     
-    # CORRECT chain order: prompt | llm | parser
     rewrite_chain = rewrite_prompt | llm | StrOutputParser()
-    better_question = rewrite_chain.invoke({"question": state["question"]})
     
-    print(f"   Original: {state['question']}")
-    print(f"   Rewritten: {better_question}")
+    cache_key = f"rewrite_{state['question']}"
+    if cache_key in llm_cache:
+        better_question = llm_cache[cache_key]
+    else:
+        better_question = rewrite_chain.invoke({"question": state["question"]})
+        llm_cache[cache_key] = better_question
     
     return {
         "question": better_question,
-        "documents": [],  # Clear old documents
-        "needs_web_search": False,  # Reset flag
-        "retries": state["retries"]  # Keep retry count
+        "documents": [],
+        "needs_web_search": False,
+        "retries": state["retries"]
     }
-    
+
 def generate(state: GraphState) -> Dict:
-    """
-    Node 4: Generate final answer from relevant documents
-    FIXED: Correct chain order (prompt | llm | parser)
-    FIXED: Proper prompt template with context
-    """
-    print("\n---🤖 NODE: GENERATE ---")
-    
+    """Generate answer from relevant documents"""
     if not state["documents"]:
-        print("   ⚠️ No documents available - generating without context")
-        context = "No relevant documents found. Answer based on general knowledge."
+        context = "No relevant documents found."
     else:
         context = "\n\n".join([doc.page_content for doc in state["documents"]])
     
-    llm = ChatOllama(model="mistral", temperature=0)
+    llm = ChatOllama(model=MODEL_NAME, temperature=0.3, num_predict=200)
     
-    # FIXED: Correct template with context
     generate_prompt = PromptTemplate(
-        template="""Answer the question based on the following context:
-        
-        Context: {context}
-        
-        Question: {question}
-        
-        Answer concisely and accurately based ONLY on the context provided:""",
+        template="""Context: {context}
+Question: {question}
+Answer based only on context:""",
         input_variables=["context", "question"],
     )
     
-    # FIXED: Correct chain order (prompt | llm | parser)
     generate_chain = generate_prompt | llm | StrOutputParser()
     
-    print(f"   Context length: {len(context)} chars")
-    
-    answer = generate_chain.invoke({
-        "context": context,
-        "question": state["question"]
-    })
-    
-    print(f"   ✅ Generated answer of length {len(answer)} chars")
-    
-    return {
-        "generation": answer,
-        "question": state["question"],
-        "documents": state["documents"]
-    }
-    
-# ============ PART 4: BUILD THE GRAPH ============
-
-def decide_next_node(state: GraphState) -> str:
-    """
-    Conditional edge - decides where to go next
-    FIXED: Added max retries protection (2 attempts max)
-    FIXED: Better logging for debugging
-    """
-    print("\n---🔀 DECIDING NEXT NODE ---")
-    print(f"   Retries: {state['retries']}")
-    print(f"   Needs web search: {state.get('needs_web_search', False)}")
-    print(f"   Documents found: {len(state.get('documents', []))}")
-    
-    # FIXED: Max 2 retries to prevent infinite loops
-    if state["retries"] >= 2:
-        print("   ⚠️ MAX RETRIES REACHED - forcing generate")
-        return "generate"
-    
-    # Only rewrite if we need search AND have no relevant documents
-    if state.get("needs_web_search", False) and len(state.get("documents", [])) == 0:
-        print("   ➡️ No relevant docs found - rewriting query")
-        return "rewrite_query"
+    cache_key = f"gen_{hash(context[:200])}_{state['question']}"
+    if cache_key in llm_cache:
+        answer = llm_cache[cache_key]
     else:
-        print("   ➡️ Have relevant documents - generating answer")
+        answer = generate_chain.invoke({
+            "context": context,
+            "question": state["question"]
+        })
+        llm_cache[cache_key] = answer
+    
+    return {"generation": answer, "question": state["question"], "documents": state["documents"]}
+
+# ============ BUILD GRAPH ============
+def decide_next_node(state: GraphState) -> str:
+    """Self-correction decision logic"""
+    if state["retries"] >= MAX_RETRIES:
         return "generate"
+    if state.get("needs_web_search", False) and len(state.get("documents", [])) == 0:
+        return "rewrite_query"
+    return "generate"
 
 def build_self_correcting_rag():
-    """
-    Assemble all nodes into a LangGraph workflow
-    FIXED: Using START constant (modern LangGraph)
-    FIXED: Added return statement for compiled graph
-    """
-    # CORRECT: Pass GraphState schema to StateGraph
     workflow = StateGraph(GraphState)
-    
-    # Add all nodes
-    workflow.add_node("retrieve", retrieve)  
+    workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
     workflow.add_node("rewrite_query", rewrite_query)
     workflow.add_node("generate", generate)
-    
-    # Define the flow
-    workflow.add_edge(START, "retrieve")  # Modern way: use START constant
+    workflow.add_edge(START, "retrieve")
     workflow.add_edge("retrieve", "grade_documents")
-    
-    # Conditional edge from grade_documents
     workflow.add_conditional_edges(
         "grade_documents",
         decide_next_node,
-        {
-            "rewrite_query": "rewrite_query",
-            "generate": "generate"
-        }
-    )  
-    
-    # Connect rewrite back to retrieve (the feedback loop!)
+        {"rewrite_query": "rewrite_query", "generate": "generate"}
+    )
     workflow.add_edge("rewrite_query", "retrieve")
     workflow.add_edge("generate", END)
-    
-    # FIXED: Return the compiled graph
     return workflow.compile()
-    
-# Build the graph
+
 app = build_self_correcting_rag()
-print("✅ Graph built and compiled - ready to run!")
 
-# ============ PART 5: RUN THE AGENT ============
+# ============ WARMUP ============
+def warm_up():
+    """Pre-load models without breaking self-correction"""
+    try:
+        _ = retriever.invoke("warm up")
+        warmup_llm = ChatOllama(model=MODEL_NAME, temperature=0)
+        _ = warmup_llm.invoke("Hello")
+    except:
+        pass
 
-def run_rag_agent(question: str):
-    """Run the agent with a question and show the process"""
-    print("\n" + "="*70)
-    print(f"🚀 QUESTION: {question}")
-    print("="*70)
+warmup_thread = threading.Thread(target=warm_up)
+warmup_thread.daemon = True
+warmup_thread.start()
+
+# ============ API FUNCTIONS ============
+def ask_with_stats(question: str) -> Dict:
+    start = time.time()
     
     initial_state = {
         "question": question,
@@ -323,44 +280,53 @@ def run_rag_agent(question: str):
         "needs_web_search": False
     }
     
+    cache_key = f"full_{question}"
+    if cache_key in llm_cache:
+        result = llm_cache[cache_key]
+        result["time"] = time.time() - start
+        result["cached"] = True
+        return result
+    
     try:
         final_state = app.invoke(initial_state)
-        
-        print("\n" + "="*70)
-        print("✅ FINAL ANSWER:")
-        print("-"*70)
-        print(final_state.get("generation", "No answer generated"))
-        print("="*70)
-        
-        # Show stats
-        if final_state.get("retries", 0) > 0:
-            print(f"\n📊 Stats: Needed {final_state['retries']} rewrite attempt(s)")
-        
-        return final_state
+        elapsed = time.time() - start
+        result = {
+            "answer": final_state.get("generation", "No answer"),
+            "retries": final_state.get("retries", 0),
+            "time": elapsed,
+            "success": True
+        }
+        llm_cache[cache_key] = result
+        return result
     except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        return {
+            "answer": f"Error: {str(e)}",
+            "retries": 0,
+            "time": time.time() - start,
+            "success": False
+        }
 
-# Run tests
+def ask(question: str) -> str:
+    return ask_with_stats(question).get("answer", "")
+
+# ============ COMMAND LINE ============
 if __name__ == "__main__":
-    print("\n" + "🔥"*35)
-    print("   SELF-CORRECTING RAG WITH LOCAL LLMS")
-    print("🔥"*35)
-    
-    # Test questions
-    questions = [
-        "What is an AI agent?",
-        "Tell me about chain of thought",
-        "How does prompt engineering work?",
-        "What is machine learning?",  # Might not be in docs
-    ]
-    
-    for i, q in enumerate(questions, 1):
-        print(f"\n--- TEST {i}/{len(questions)} ---")
-        run_rag_agent(q)
-        if i < len(questions):
-            input("\nPress Enter for next question...")
-    
-    print("\n🎉 All tests complete!")
+    if len(sys.argv) > 1:
+        question = " ".join(sys.argv[1:])
+        result = ask_with_stats(question)
+        print(f"\nQ: {question}")
+        print(f"A: {result['answer']}")
+        print(f"\n⏱️  {result['time']:.2f}s | 🔄 {result['retries']} retries")
+    else:
+        print("\n" + "🔥"*35)
+        print("   SELF-CORRECTING RAG")
+        print("🔥"*35)
+        print("\nType 'quit' to exit\n")
+        
+        while True:
+            q = input("\n❓ Question: ")
+            if q.lower() in ['quit', 'exit', 'q']:
+                break
+            result = ask_with_stats(q)
+            print(f"\n✅ Answer: {result['answer'][:200]}..." if len(result['answer']) > 200 else f"\n✅ Answer: {result['answer']}")
+            print(f"⏱️  {result['time']:.2f}s | 🔄 {result['retries']} retries")

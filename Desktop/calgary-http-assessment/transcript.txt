@@ -1,0 +1,6 @@
+Hello, this is my explanation for the Web Server Log Analysis assessment.
+I used Python, pandas, and regular expressions to clean and analyze the dataset.
+I implemented all 10 questions and provided outputs in the Jupyter Notebook.
+This includes total requests, unique hosts, 404 errors, and bandwidth usage.
+The code was executed step-by-step, and outputs are clearly shown.
+Thank you for reviewing.
