@@ -15,12 +15,10 @@ from dotenv import load_dotenv
 from typing import Dict, List, TypedDict, Annotated, Literal
 import operator
 
-# Suppress verbose logging
 import logging
 logging.getLogger().setLevel(logging.ERROR)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Chroma import
 try:
     from langchain_chroma import Chroma
 except ImportError:
@@ -41,10 +39,10 @@ load_dotenv()
 # ============ CONFIGURATION ============
 VECTORSTORE_PATH = "chroma_db"
 DOCS_CACHE = "docs_cache.pkl"
-MAX_RETRIES = 2                # Self-correction needs retries
-TOP_K_RESULTS = 3               # Enough documents to grade
+MAX_RETRIES = 2                
+TOP_K_RESULTS = 3               
 SILENT_MODE = True
-MODEL_NAME = "tinyllama"        # Fast enough for self-correction
+MODEL_NAME = "tinyllama"        
 TIMEOUT_SECONDS = 60
 
 # ============ CACHES ============
